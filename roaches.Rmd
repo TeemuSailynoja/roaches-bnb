@@ -1,0 +1,885 @@
+---
+title: "Roaches cross-validation demo"
+author: "[Aki Vehtari](https://users.aalto.fi/~ave/)"
+author: "Modified by Teemu Säilynoja"
+date: "First version 2017-01-10. Last modified `r format(Sys.Date())`."
+output:
+  html_document:
+    fig_caption: yes
+    toc: TRUE
+    toc_depth: 2
+    number_sections: TRUE
+    toc_float:
+      smooth_scroll: FALSE
+    code_download: true
+bibliography: modelsel.bib
+csl: harvard-cite-them-right.csl
+link-citations: yes
+---
+
+# Setup  {.unnumbered}
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=FALSE, message=FALSE, error=FALSE, warning=FALSE, comment=NA, out.width='95%')
+```
+
+
+**Load packages**
+
+```{r}
+library(rstanarm)
+library(brms)
+library(cmdstanr)
+options(mc.cores = 4)
+library(loo)
+library(ggplot2)
+library(ggdist)
+library(bayesplot)
+theme_set(bayesplot::theme_default(base_family = "sans"))
+library(posterior)
+options(posterior.num_args=list(digits=2))
+library(priorsense)
+library(dplyr)
+library(tibble)
+```
+
+
+# Introduction
+
+This notebook demonstrates cross-validation model comparison and
+cross-validation predictive checking of models. Furthermore the
+notebook demonstrates how to use integrated PSIS-LOO with
+varying intercept ("random effect") models.
+
+The roaches data example comes from Chapter 8.3 of [Gelman and Hill
+(2007)](http://www.stat.columbia.edu/~gelman/arm/) and the
+introduction text for the data is from [Estimating Generalized
+Linear Models for Count Data with
+rstanarm](https://cran.r-project.org/web/packages/rstanarm/vignettes/count.html)
+by Jonah Gabry and Ben Goodrich.
+
+We want to make inferences about the efficacy of a certain pest
+management system at reducing the number of roaches in urban
+apartments. Here is how Gelman and Hill describe the experiment
+(pg. 161):
+
+> the treatment and control were applied to 160 and 104 apartments,
+respectively, and the outcome measurement $y_i$ in each apartment
+$i$ was the number of roaches caught in a set of traps. Different
+apartments had traps for different numbers of days
+
+In addition to an intercept, the regression predictors for the
+model are the pre-treatment number of roaches `roach1`, the
+treatment indicator `treatment`, and a variable indicating whether
+the apartment is in a building restricted to elderly residents
+`senior`. Because the number of days for which the roach traps were
+used is not the same for all apartments in the sample, we include
+it as an `exposure2` by adding $\ln(u_i)$) to the linear predictor
+$\eta_i$ and it can be specified using the `offset` argument to
+`stan_glm`.
+
+# Poisson model
+
+Load data
+
+```{r}
+data(roaches)
+# Roach1 is very skewed and we take a square root
+roaches$sqrt_roach1 <- sqrt(roaches$roach1)
+```
+
+
+Make a Poisson regression model with `rstanarm`
+
+```{r results='hide'}
+stan_glmp <- stan_glm(y ~ sqrt_roach1 + treatment + senior, offset = log(exposure2),
+                      data = roaches, family = poisson, 
+                      prior = normal(0,2.5), prior_intercept = normal(0,5),
+                      chains = 4, cores = 1, seed = 1704009, refresh=0)
+```
+
+
+## Analyse posterior
+
+Plot posterior
+
+```{r}
+mcmc_areas(as.matrix(stan_glmp), prob_outer = .999,
+           pars = c("sqrt_roach1","treatment","senior"))
+```
+
+
+All marginal posteriors are clearly away from zero.
+
+## Cross-validation checking
+
+We can use Pareto-smoothed importance sampling leave-one-out (PSIS-LOO)
+cross-validation as model checking tool
+[@Vehtari+etal:PSIS-LOO:2017].
+
+```{r}
+(loop <- loo(stan_glmp))
+```
+
+`p_loo` is about 260, which is much higher than the number of
+parameters p=4, which indicates bad misspecification which we are
+like likely to see also with posterior predictive checking (see,
+https://mc-stan.org/loo/reference/loo-glossary.html#pareto-k-estimates-1)
+
+
+We can check the observation specific plot Pareto-$\hat{k}$ values.
+
+```{r}
+plot(loop)
+```
+
+
+There are several observations which are highly influential, which
+indicates potential model misspecification [@Vehtari+etal:PSIS-LOO:2017].
+
+Before looking in more detail where the problem is or fixing it,
+let's check what would cross-validation say about relevance of
+covariates.
+
+We form 3 models by dropping each of the covariates out. We later
+compare these to results from other models.
+
+```{r results='hide'}
+stan_glmm1p <- update(stan_glmp, formula = y ~ treatment + senior)
+stan_glmm2p <- update(stan_glmp, formula = y ~ sqrt_roach1 + senior)
+stan_glmm3p <- update(stan_glmp, formula = y ~ sqrt_roach1 + treatment)
+```
+
+
+Although Pareto $k$ values were very large we can make a quick test
+with PSIS-LOO (if the comparison would say there is difference,
+then PSIS-LOO couldn't be trusted and refitting problematic folds
+or $K$-fold-CV would be needed [see more in
+@Vehtari+etal:PSIS-LOO:2017]).
+
+```{r}
+loo_compare(loo(stan_glmm1p), loop)
+loo_compare(loo(stan_glmm2p), loop)
+loo_compare(loo(stan_glmm3p), loop)
+```
+
+Based on this the roaches covariate would be relevant, but although
+dropping treatment or senior covariate will make a large change to
+elpd, the uncertainty is also large and cross-validation states
+that these covariates are not necessarily relevant! The posterior
+marginals are conditional on the model, but cross-validation is
+more cautious by not using any model for the future data
+distribution.
+
+## Posterior predictive checking
+
+In addition of cross-validation, the posterior predictive checks
+can often detect problems and also provide more information about
+the reason. As the range of counts is large, we can use kernel
+density estimate plot.
+
+```{r}
+pp_check(stan_glmp, plotfun = "dens_overlay", nreps=20) +
+  scale_x_sqrt(breaks=c(0,1,3,10,30,100,300), lim=c(0,400))
+```
+
+We see that the marginal distribution of model replicated data is
+clearly different from the observed data.
+
+We test additionally the proportion of zeros predicted by the model
+and compare them to the observed number of zeros.
+
+```{r}
+prop_zero <- function(y) mean(y == 0)
+(prop_zero_test1 <- pp_check(stan_glmp, plotfun = "stat", stat = "prop_zero"))
+```
+
+
+# Negative binomial model
+
+We change the Poisson model to a more robust negative binomial model.
+
+```{r results='hide'}
+stan_glmnb <- update(stan_glmp, family = neg_binomial_2)
+```
+
+
+## Analyse posterior
+
+Plot posterior
+
+```{r}
+mcmc_areas(as.matrix(stan_glmnb), prob_outer = .999,
+    pars = c("sqrt_roach1","treatment","senior"))
+```
+
+
+Treatment effect is much closer to zero, and senior effect has lot
+of probability mass on both sides of 0. So it matters, which model
+we use.
+
+We discuss posterior dependencies in more detail in `collinear`
+notebook, but for reference we plot also here paired marginals.
+
+```{r}
+mcmc_pairs(as.matrix(stan_glmnb),
+           pars = c("sqrt_roach1","treatment","senior"))
+```
+
+
+There are some posterior correlations, but not something which
+would change our conclusions.
+
+## Cross-validation checking
+
+Let's check PSIS-LOO and Pareto $k$ diagnostics
+
+```{r}
+(loonb <- loo(stan_glmnb, save_psis=TRUE))
+```
+
+All khat's are ok, which indicates that negative-binomial would be
+better. We can also compare Poisson and negative-binomial.
+
+```{r}
+loo_compare(loop, loonb)
+```
+
+Negative-binomial model is clearly better than Poisson.
+
+As Poisson is a special case of negative-Binomial, we could have
+also seen that Poisson is likely by looking at the posterior of the
+over-dispersion parameter (which gets very small values).
+
+```{r}
+mcmc_areas(as.matrix(stan_glmnb), prob_outer = .999,
+    pars = c("reciprocal_dispersion"))
+```
+
+
+## Posterior predictive checking
+
+We use posterior predictive checking to compare marginal
+distributions.
+
+```{r}
+pp_check(stan_glmnb, plotfun = "dens_overlay", nreps=20) +
+  scale_x_sqrt(breaks=c(0,1,3,10,30,100,300), lim=c(0,400))
+```
+
+We see that the negative-binomial model is much better although not
+perfect as the model predictive distribution has more mass for
+small counts than the real data.
+
+```{r}
+#at the moment pit computation is not correct for discrete (PR in progress)
+#pp_check(stan_glmnb, plotfun = "pit_ecdf")
+pit <- function(y, yrep) {
+  n_draws <- nrow(yrep)
+  pit <- sapply(1:length(y),
+         \(n) {
+           mean(y[n] > yrep[, n]) +
+             # randomized PIT for discrete y (Czado, C., Gneiting, T.,
+             # Held, L.: Predictive model assessment for count
+             # data. Biometrics 65(4), 1254–1261 (2009).)
+             sample(sum(y[n] == yrep[, n]), 1) / n_draws
+         })
+  pmax(pmin(pit, 1), 0)
+}
+```
+
+Overall the PIT distribution looks fine
+
+```{r}
+ppc_pit_ecdf(pit=pit(y = roaches$y, yrep = posterior_predict(stan_glmnb)))
+```
+
+Previously this notebook used only probability of zeros as the statistic,
+which misses the miscalibration seen in density plots and PIT plots
+
+```{r}
+(prop_zero_test2 <- pp_check(stan_glmnb, plotfun = "stat", stat = "prop_zero"))
+```
+
+The posterior predictive check compares observations to the
+posterior predictive distribution which is conditioned on the same
+observations. We can avoid double use of data, by using LOO
+predictive distributions. Natural statistic is PIT which should
+have approximately uniform distribution if the model is well
+calibrated.
+
+```{r}
+#pp_check(stan_glmnb, plotfun = "loo_pit_qq") +
+loo_pit <- function(y, yrep, lw) {
+  pit <- vapply(seq_len(ncol(yrep)), function(j) {
+    sel_min <- yrep[, j] < y[j]
+    pit_min <- exp_log_sum_exp(lw[sel_min,j])
+    sel_sup <- yrep[, j] == y[j]
+    pit_sup <- pit_min + exp_log_sum_exp(lw[sel_sup,j])
+    runif(1, pit_min, pit_sup)
+  }, FUN.VALUE = 1)
+  pmax(pmin(pit, 1), 0)
+}
+exp_log_sum_exp <- function(x) {
+  m <- suppressWarnings(max(x))
+  exp(m + log(sum(exp(x - m))))
+}
+```
+
+Bayesplot includes `loo_pit_qq` for checking how uniform LOO-PIT distribution is.
+
+```{r}
+ppc_loo_pit_qq(pit=loo_pit(y = roaches$y, yrep = posterior_predict(stan_glmnb),
+                           lw=weights(loonb$psis_object))) +
+  geom_abline() +
+  ylim(c(0,1))
+```
+
+We can use also the `pit_ecdf` plot to make the comparison to
+posterior predictive PIT values easier.
+
+```{r}
+ppc_pit_ecdf(pit=loo_pit(y = roaches$y, yrep = posterior_predict(stan_glmnb),
+                         lw = weights(loonb$psis_object)))
+```
+
+We can compare posterior-PIT and LOO-PIT directly
+
+```{r}
+yrep = posterior_predict(stan_glmnb)
+data.frame(pit=sort(pit(y = roaches$y, yrep = posterior_predict(stan_glmnb))),
+           loopit=sort(loo_pit(y = roaches$y, yrep = posterior_predict(stan_glmnb),
+                               lw = weights(loonb$psis_object)))) |>
+  ggplot(aes(x=pit,y=loopit)) +
+  geom_point() +
+  geom_abline() +
+  labs(x='Posterior-PIT',y='LOO-PIT')
+```
+
+There is not much difference as the number of observations is much
+larger than the number of parameters, and the posterior predictive
+distributions and LOO-predictive distributions are similar.
+
+```{r}
+## A=seq(0.01,0.99,by=0.01)
+## loopit <- loo_pit(y = roaches$y, yrep = posterior_predict(stan_glmnb),
+##                          lw = weights(loonb$psis_object))
+## data.frame(A=A,Aloo=sapply(A,\(a) {mean(loopit>=0.5-a/2 & loopit<=0.5+a/2)}))|>
+##   ggplot(aes(x=A,y=Aloo))+
+##   geom_point() +
+##   labs(x='Nominal central coverage', y='Observed LOO coverage')+
+##   geom_abline()
+```
+
+
+## Predictive relevance of covariates
+
+Let's finally check cross-validation model comparison that it
+agrees on relevance of covariates
+
+```{r results='hide'}
+stan_glmm1nb <- update(stan_glmm1p, family = neg_binomial_2)
+stan_glmm2nb <- update(stan_glmm2p, family = neg_binomial_2)
+stan_glmm3nb <- update(stan_glmm3p, family = neg_binomial_2)
+```
+
+
+
+```{r}
+loo_compare(loo(stan_glmm1nb), loonb)
+loo_compare(loo(stan_glmm2nb), loonb)
+loo_compare(loo(stan_glmm3nb), loonb)
+```
+
+Covariate `roaches1` has clear effect. `treatment` effect is
+visible in marginal posterior, but as discussed in `betablockers`
+demo, cross-validation is not good for detecting weak
+effects. Based on cross-validation senior effect is also having
+negligible effect in the predictive performance.
+
+Conclusion from the analysis would be then that, `treatment` is
+likely to help, but it's difficult to predict the number of roaches
+given `treatment` or not.
+
+# Poisson model with varying intercepts
+
+Sometimes overdispersion is modelled by adding varying intercepts
+("random effects") for each individual. The following example
+illustrates computational problems in this approach.
+
+Fit with stan_glm
+
+```{r results='hide'}
+roaches$id <- 1:dim(roaches)[1]
+stan_glmpr <- stan_glmer(y ~ sqrt_roach1 + treatment + senior + (1 | id), 
+                         offset = log(exposure2),
+                         data = roaches, family = poisson, 
+                         prior = normal(0,2.5), prior_intercept = normal(0,5),
+                         chains = 4, cores = 4, iter = 4000, 
+                         seed = 1704009, refresh=0)
+```
+
+
+## Analyse posterior
+
+Plot posterior
+
+```{r}
+mcmc_areas(as.matrix(stan_glmpr), prob_outer = .999,
+    pars = c("sqrt_roach1","treatment","senior"))
+```
+
+
+The marginals are similar as with negative-binomial model except the
+marginal for `senior` is clearly away from zero.
+
+## Cross-validation checking
+
+Let's check PSIS-LOO.
+
+```{r}
+(loopr <- loo(stan_glmpr, save_psis=TRUE))
+```
+
+`p_loo` is about 175, which is less than the number of parameters
+267, but it is relatively large compared to to the number of
+observations (`p_loo >>N/5`), which indicates very flexible
+model. In this case his is due to having an intercept
+parameter for each observations. Removing one observation changes
+the posterior for that intercept so much that importance
+sampling fails (even with Pareto smoothing). Note that WAIC would
+fail due to the same reason.
+
+We can also plot Pareto $k$ values.
+
+```{r}
+plot(loopr)
+```
+
+We have a very large number of high $k$ values which indicates very flexible model.
+
+While importance sampling in PSIS-LOO can fail for varying parameter
+model, we can use $K$-fold-CV instead to re-fit the model 10 times,
+each time leaving out 10% of the observations. This shows that
+cross-validation itself is not infeasible for varying parameter models.
+
+```{r}
+(kcvpr <- kfold(stan_glmpr, K=10))
+```
+
+
+loo package allows comparing PSIS-LOO and $K$-fold-CV results
+
+```{r}
+loo_compare(loonb, kcvpr)
+```
+
+
+There is not much difference, and this difference could also be
+explained by $K$-fold-CV using only 90% of observations for the
+posteriors, while PSIS-LOO is using 99.6% of observations for the
+posteriors. We can check this by running $K$-fold-CV also for
+negative-binomial model.
+
+```{r}
+(kcvnb <- kfold(stan_glmnb, K=10))
+loo_compare(kcvnb, kcvpr)
+```
+
+
+When both models are assessed using $K$-fold-CV, the difference in
+predictive performance is very small. The models can still have
+different predictive distributions.
+
+Now that we've seen that based on robust $K$-fold-CV there is not
+much difference between negative-binomial and varying-intercept-Poisson
+models, we can also check how bad the comparison would have been
+with PSIS-LOO.
+
+```{r}
+loo_compare(loonb, loopr)
+```
+
+
+If we would have ignored Pareto-$k$ warnings, we would have
+mistakenly assumed that varying intercept model is much better. Note
+that WAIC is (as usual) even worse (see also @Vehtari+etal:PSIS-LOO:2017)
+
+```{r}
+loo_compare(waic(stan_glmnb), waic(stan_glmpr))
+```
+
+
+## Posterior predictive checking
+
+We do posterior predictive checking for varying intercept Poisson  model.
+
+```{r}
+pp_check(stan_glmpr, plotfun = "dens_overlay", nreps=20) +
+  scale_x_sqrt(breaks=c(0,1,3,10,30,100,300), lim=c(0,400))
+```
+
+The match looks perfect, but that can be explained with having one
+parameter for each observation and kernel density estimate hiding something.
+PIT-ECDF plot shows problems
+
+```{r}
+ppc_pit_ecdf(pit=pit(y = roaches$y, yrep = posterior_predict(stan_glmpr)))
+```
+
+There are too many PIT values near 0.5. If we look at the
+predictive intervals and observations, we see that many the
+observations are in the middle of the posterior predictive
+interval, which can be explained by having very flexible model with
+one parameter for each observation.
+
+```{r}
+ppc_intervals(y = roaches$y, yrep = posterior_predict(stan_glmpr))
+```
+
+LOO-PIT's are not much better, because PSIS-LOO fails (remember the
+high Pareto-$\hat{k}$'s)
+
+```{r}
+## pp_check(stan_glmpr, plotfun = "loo_pit_qq") +
+##   geom_abline() +
+##   ylim(c(0,1))
+## ppc_loo_pit_qq(pit=loo_pit(y = roaches$y, yrep = posterior_predict(stan_glmpr),
+##                            lw=weights(loopr$psis_object))) +
+##   geom_abline() +
+##   ylim(c(0,1))
+ppc_pit_ecdf(pit=loo_pit(y = roaches$y, yrep = posterior_predict(stan_glmpr),
+                         lw=weights(loopr$psis_object)))
+```
+
+# Poisson model with varying intercept and integrated LOO
+
+Removing one observation changes the posterior for that intercept
+so much that importance sampling fails (even with Pareto
+smoothing). We can get improved stability by integrating that 
+intercept out with something more accurate than the importance
+sampling [@Vehtari+etal:2016:LOO_for_GLVM].  If there is only one
+group or individual specific parameter then we can integrate that
+out easily with adaptive quadrature (2 parameters with 2D
+quadrature would work, too, which could be implemented with nested
+1D quadratures).
+
+As we can easily integrate out only 1 (or 2) parameters (per group
+/ individual), it's not easy to make a generic approach for `rstanarm`
+and brms, and thus I illustrate the approach with direct Stan model
+code and `cmdstanr`.
+
+The following Stan model uses individual specific intercept term
+`z[i]` (with common prior with scale `sigmaz`). In the generated
+quantities, the usual `log_lik` computation is replaced with
+integrated approach. We also generate `y_loorep` which is the LOO
+predictive distribution given other parameters than `z`. This is
+needed to get the correct LOO predictive distributions when
+combined with integrated PSIS-LOO.
+
+```{r}
+poisson_re_int <- "poisson_re_integrate.stan"
+writeLines(readLines(poisson_re_int))
+```
+
+
+Compile the model, prepare the data, and sample. `integrate_1d_reltol`
+sets the relative tolerance for the adaptive 1D quadrature function
+`integrate_1d` (if with other model and data you see messages about
+error estimate of integral exceeding the given relative tolerance
+times norm of integral, you will get NaNs and need to increase the
+relative tolerance).
+
+```{r results='hide'}
+modpri <- cmdstan_model(stan_file = poisson_re_int)
+datap <- list(N = dim(roaches)[1],
+              P = 3,
+              offsett = log(roaches$exposure2),
+              X = roaches[,c('sqrt_roach1','treatment','senior')],
+              y = roaches$y,
+              integrate_1d_reltol = 1e-6)
+fitpri <- modpri$sample(data = datap, refresh = 0, chains = 4, parallel_chains = 4)
+```
+
+
+The posterior is similar as above for varying intercept Poisson model
+(as it should be, as the generated quantities is not affecting
+the posterior).
+
+```{r}
+mcmc_areas(as_draws_matrix(fitpri$draws(variables=c('beta','sigmaz'))),
+           prob_outer = .999)
+```
+
+Now the PSIS-LOO doesn't give warnings and the result is close to K-fold-CV.
+
+```{r}
+(loopri <- fitpri$loo(save_psis=TRUE))
+```
+
+Comparing to the negative binomial model gives only slight
+improvement in predictive performance.
+
+```{r}
+loo_compare(fitpri=loopri, loonb)
+```
+
+Posterior predictive checking with KDE looks very good, but that
+can be explained with having one parameter for each observation and
+posterior predictive checking cannot be trusted.
+
+```{r}
+drm <- fitpri$draws(format='matrix')
+y_rep <- subset_draws(drm,variable='y_rep')
+pp_check(roaches$y, y_rep[sample(1:4000,20),], fun='dens_overlay') +
+  scale_x_sqrt(breaks=c(0,1,3,10,30,100,300), lim=c(0,400))
+```
+
+PIT-ECDF's are the same as for the varying intercept Poisson
+LOO-PIT's look good as integrated LOO helps.
+
+```{r}
+y_loorep <- subset_draws(drm,variable='y_loorep')
+## pp_check(roaches$y, yrep=y_loorep, fun='loo_pit_qq', lw=weights(loopri$psis_object)) +
+##   geom_abline() +
+##   ylim(c(0,1))
+## ppc_loo_pit_qq(pit=loo_pit(y = roaches$y, yrep = y_loorep,
+##                            lw=weights(loopri$psis_object))) +
+##   geom_abline() +
+##   ylim(c(0,1))
+ppc_pit_ecdf(pit=loo_pit(y = roaches$y, yrep = y_loorep,
+                         lw=weights(loopri$psis_object)))
+```
+
+# Zero-inflated negative-binomial model
+
+As the proportion of zeros is quite high in the data, it is
+worthwhile to test also a zero-inflated negative-binomial model,
+which is a mixture of two models
+ - logistic regression to model the proportion of extra zero counts
+ - negative-binomial model
+
+We switch to `brms` as `rstanarm` doesn't support zero-inflated
+negative-binomial model.
+
+```{r results='hide'}
+brm_glmzinb <-
+  brm(bf(y ~ sqrt_roach1 + treatment + senior + offset(log(exposure2)),
+         zi ~ sqrt_roach1 + treatment + senior + offset(log(exposure2))),
+      family=zero_inflated_negbinomial(), data=roaches,
+      prior=c(prior(normal(0,3), class='b'),
+              prior(normal(0,3), class='b', dpar='zi'),
+              prior(normal(0,3), class='Intercept', dpar='zi')),
+      seed=1704009, refresh=1000)
+```
+
+Based on PSIS-LOO, zero-inflated negative-binomial is clearly better.
+
+```{r}
+brm_glmzinb <- add_criterion(brm_glmzinb, criterion='loo', save_psis=TRUE)
+(loozinb <- loo(brm_glmzinb))
+loo_compare(loonb, loozinb)
+```
+
+Posterior predictive checking looks good, but there is no clear difference
+to negative-binomial in most checks.
+
+```{r}
+pp_check(brm_glmzinb, type='dens_overlay') +
+    scale_x_sqrt(breaks=c(0,1,3,10,30,100,300), lim=c(0,400))
+
+ppc_pit_ecdf(pit=pit(y = roaches$y, yrep = posterior_predict(brm_glmzinb)))
+```
+
+LOO-PIT-ECDF
+
+```{r}
+ppc_pit_ecdf(pit=loo_pit(y = roaches$y, yrep = posterior_predict(brm_glmzinb),
+                         lw = weights(loozinb$psis_object)))
+```
+
+Proportion of zeros is similar, but has more variation compared to
+negative-binomial model.
+
+```{r}
+pp_check(brm_glmzinb, type='stat', stat=\(y) mean(y==0))
+```
+
+There is much bigger difference in max count test statistic. We
+first check the max count PPC for negative-binomial model.
+
+```{r}
+pp_check(stan_glmnb, plotfun = "stat", stat = "max") +
+  scale_x_sqrt(breaks=c(100,300,1000,3000,10000,30000))
+```
+
+
+which shows that negative-binomial model is predicting often 10-100
+larger roach counts than in the data (30,000 roaches in one trap is
+a lot).
+
+The max count PPC for zero-inflated negative-binomial model
+
+```{r}
+pp_check(brm_glmzinb, type = "stat", stat = "max") +
+  scale_x_sqrt(breaks=c(100,300,1000,3000,10000))
+```
+
+
+is much better, although still the max counts can be 10 times bigger
+than the max count in the data.
+
+The difference in the max counts can be explained so that the plain
+negative binomial model has smaller shape parameter to model the
+overdispersion in zeros but leading to long tail without
+observations. We can check the overdispersion parameters.
+
+```{r}
+# negative-binomial model 
+mean(as_draws_rvars(stan_glmnb)$reciprocal_dispersion)
+# zero-inflated negative-binomial model 
+mean(as_draws_rvars(brm_glmzinb)$shape)
+```
+
+Although the models are different, with finite data and wide LOO
+predictive distributions, there is a limit in which differences can
+be see in LOO-PIT values. Both negative-binomial and zero-inflated
+negative binomial are close enough the LOO-PIT can't see discrepancy
+from the data, but elpd_loo is still able to to show that
+zero-inflation component improves the predictive accuracy.
+
+## Analyse posterior
+
+Plot posterior
+
+```{r}
+mcmc_areas(as.matrix(brm_glmzinb)[,3:8], prob_outer = .999)
+```
+
+
+The posterior marginals for negative-binomial part are similar to marginals
+in the plain negative-binomial model. The marginal effects for the
+logistic part have opposite sign as the logistic part is modelling
+the extra zeros.
+
+The treatment effect is now divided between negative-binomial and
+logistic part. We can use the model to make predictions for the
+expected number of roaches given treatment and no-treatment.
+
+Expectations of posterior predictive distributions given treatment=0 and treatment=1
+
+```{r}
+pred <- posterior_epred(brm_glmzinb, newdata=rbind(mutate(roaches, treatment=0),
+                                                   mutate(roaches, treatment=1)))
+```
+
+Ratio of expected number of roaches with vs without treatment
+
+```{r}
+ratio <- array(rowMeans(pred[,263:524]/pred[,1:262]), c(1000, 4, 1)) |>
+  as_draws_df() |>
+  set_variables(variables='ratio')
+ratio |>
+  ggplot(aes(x=ratio)) +
+  stat_slab() +
+  labs(x='Ratio of roaches with vs without treatment', y=NULL) +
+  scale_y_continuous(breaks=NULL) +
+  theme(axis.line.y=element_blank(),
+        strip.text.y=element_blank()) +
+  xlim(c(0,1)) +
+  geom_vline(xintercept=1, linetype='dotted')
+```
+
+The treatment clearly reduces the expected number of roaches.
+
+Make prior sensitivity analysis by power-scaling both prior and
+likelihood.  Focus on the ratio of expected number of roaches
+with vs without treatment.
+
+```{r}
+powerscale_sensitivity(brm_glmzinb, prediction = \(x, ...) ratio)$sensitivity |>
+                         filter(variable=='ratio') |>
+                         mutate(across(where(is.double),  ~num(.x, digits=2)))
+```
+
+
+There is no prior sensitivity
+
+
+```{r}
+model_bnb <- cmdstan_model('example.stan',
+    include_paths=getwd(),
+    cpp_options=list(USER_HEADER='stan-case-study/src/bnb.hpp'),
+    stanc_options = list("allow-undefined")
+)
+
+fitbnb <- model$sample(data=datap)
+```
+```{r}
+ppc_dens_overlay(y = datap$y, yrep = fitbnb$draws("y_rep", format = "matrix")[1:10,]) +
+  scale_x_sqrt() + xlim(c(0,300))
+```
+
+```{r}
+ppc_pit_ecdf(pit=loo_pit(y = roaches$y, yrep = fitbnb$draws("y_rep", format = "matrix"),
+                         lw = weights(fitbnb$loo(save_psis=T)$psis_object)), plot_diff = T)
+ppc_pit_ecdf(y = roaches$y, yrep = fitbnb$draws("y_rep", format = "matrix"), plot_diff = T)
+```
+
+
+## Predictive relevance of covariates
+
+Let's finally check cross-validation model comparison to see whether improved model has effect on the predictive performance comparison.
+
+```{r results='hide'}
+brm_glmm1zinb <-
+  update(brm_glmzinb,
+         formula=bf(y ~ treatment + senior + offset(log(exposure2)),
+                    zi ~ treatment + senior + offset(log(exposure2))))
+brm_glmm2zinb <-
+  update(brm_glmzinb,
+         formula=bf(y ~ sqrt_roach1 + senior + offset(log(exposure2)),
+                    zi ~ sqrt_roach1 + senior + offset(log(exposure2))))
+brm_glmm3zinb <-
+  update(brm_glmzinb,
+         formula=bf(y ~ sqrt_roach1 + treatment + offset(log(exposure2)),
+                  zi ~ sqrt_roach1 + treatment + offset(log(exposure2))))
+```
+```{r}
+loo_compare(loo(brm_glmm1zinb),loozinb)
+loo_compare(loo(brm_glmm2zinb),loozinb)
+loo_compare(loo(brm_glmm3zinb),loozinb)
+loo_compare(fitbnb$loo(),loozinb)
+```
+
+Roaches1 has clear effect. Treatment effect improves the predictive
+performance with 95% probability (the normal approximation can be
+trusted as 1) the number of observations is larger than 100, 2) the
+elpd difference is bigger than 4, 3) there are no clear outliers,
+and 4) the distribution of the pointwise differences has finite
+variance as tested with Pareto-$\hat{k}$ diagnostic
+[@Sivula+etal:2020:loo_uncertainty;@Vehtari+etal:PSIS:2022].
+
+<br />
+
+# References {.unnumbered}
+
+<div id="refs"></div>
+
+# Licenses {.unnumbered}
+
+* Code &copy; 2017-2024, Aki Vehtari, licensed under BSD-3.
+* Text &copy; 2017-2024, Aki Vehtari, licensed under CC-BY-NC 4.0.
+* Parts of text and code &copy; 2017, Jonah Gabry and Ben Goodrich from [rstanarm vignette for count data](https://cran.r-project.org/web/packages/rstanarm/vignettes/count.html), licensed under GPL 3>
+
+# Original Computing Environment {.unnumbered}
+
+
+```{r}
+sessionInfo()
+```
+
+
+<br />
+

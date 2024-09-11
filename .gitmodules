@@ -1,0 +1,3 @@
+[submodule "stan-case-study"]
+	path = stan-case-study
+	url = git@github.com:MLGlobalHealth/stan-case-study.git
